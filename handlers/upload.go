@@ -42,7 +42,8 @@ func UploadFile(c *gin.Context) {
 
 	shardSize := len(data) / numShards
 	remainder := len(data) % numShards
-	var shardPaths []string
+	var primaryShardPaths []string
+	var redundantShardPaths [][]string
 
 	for i := 0; i < numShards; i++ {
 		start := i * shardSize
@@ -52,34 +53,62 @@ func UploadFile(c *gin.Context) {
 		}
 
 		shardData := data[start:end]
-		shardDir := filepath.Join("shards", fmt.Sprintf("node%d", i+1))
-		err := os.MkdirAll(shardDir, os.ModePerm)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create shard directory"})
+
+		primaryNode := i % totalNodes
+		primaryDir := filepath.Join("shards", fmt.Sprintf("node%d", primaryNode+1))
+		os.MkdirAll(primaryDir, os.ModePerm)
+
+		//shardDir := filepath.Join("shards", fmt.Sprintf("node%d", i+1))
+		//err := os.MkdirAll(shardDir, os.ModePerm)
+		//if err != nil {
+		//	c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create shard directory"})
+		//	return
+		//}
+
+		shardFilename := fmt.Sprintf("%s.part%d", saveAs, i+1)
+		//if err := os.WriteFile(shardFilename, shardData, 0644); err != nil {
+		//	c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to write shard"})
+		//	return
+		//}
+		//
+		//shardPaths = append(shardPaths, shardFilename)
+		primaryPath := filepath.Join(primaryDir, shardFilename)
+		if err := os.WriteFile(primaryPath, shardData, 0644); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to write primary shard"})
 			return
 		}
+		primaryShardPaths = append(primaryShardPaths, primaryPath)
 
-		shardFilename := filepath.Join(shardDir, saveAs+fmt.Sprintf(".part%d", i+1))
-		if err := os.WriteFile(shardFilename, shardData, 0644); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to write shard"})
-			return
+		var replicas []string
+		for r := 1; r <= replicationFactor; r++ {
+			replicaNode := (primaryNode + r) % totalNodes
+			replicaDir := filepath.Join("shards", fmt.Sprintf("node%d", replicaNode+1))
+			os.MkdirAll(replicaDir, os.ModePerm)
+
+			replicaPath := filepath.Join(replicaDir, shardFilename)
+			if err := os.WriteFile(replicaPath, shardData, 0644); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to write replica shard"})
+				return
+			}
+			replicas = append(replicas, replicaPath)
 		}
-
-		shardPaths = append(shardPaths, shardFilename)
+		redundantShardPaths = append(redundantShardPaths, replicas)
 	}
 
 	_, err = db.DB.Exec(`
-        INSERT INTO file_metadata (filename, num_shards, shard_paths)
-        VALUES ($1, $2, $3)
-    `, saveAs, numShards, pq.Array(shardPaths))
+        INSERT INTO file_metadata (filename, num_shards, primary_shards, redundant_shards)
+        VALUES ($1, $2, $3, $4)
+    `, saveAs, numShards, pq.Array(primaryShardPaths), pq.Array(redundantShardPaths))
 	if err != nil {
+		fmt.Println("DB Failed to insert file metadata:", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to store metadata in DB"})
 		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"message":  "File sharded and uploaded successfully",
-		"filename": saveAs,
-		"shards":   shardPaths,
+		"message":          "File uploaded and sharded with redundancy",
+		"filename":         saveAs,
+		"primary_shards":   primaryShardPaths,
+		"redundant_shards": redundantShardPaths,
 	})
 }
