@@ -4,16 +4,18 @@ import (
 	"fmt"
 	"github.com/gin-gonic/gin"
 	"github.com/lib/pq"
+	"github.com/rithvik-vasishta/dropbox-clone/backend/config"
 	"github.com/rithvik-vasishta/dropbox-clone/backend/db"
+	"github.com/rithvik-vasishta/dropbox-clone/backend/utils"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
 )
 
-const numShards = 5
-const replicationFactor = 2
-const totalNodes = 8
+numShards := config.NumShards
+replicationFactor := config.ReplicationFactor
+totalNodes := config.TotalNodes
 
 func UploadFile(c *gin.Context) {
 	fileHeader, err := c.FormFile("file")
@@ -56,22 +58,27 @@ func UploadFile(c *gin.Context) {
 
 		primaryNode := i % totalNodes
 		primaryDir := filepath.Join("shards", fmt.Sprintf("node%d", primaryNode+1))
+
+		if !utils.IsNodeAlive(primaryDir) {
+			fmt.Printf("Primary node %s down. Looking for fallback...\n", primaryDir)
+			found := false
+			for j := 0; j < config.TotalNodes; j++ {
+				fallbackDir := fmt.Sprintf("shards/node%d", j+1)
+				if utils.IsNodeAlive(fallbackDir) {
+					primaryDir = fallbackDir
+					found = true
+					fmt.Printf("Using %s instead.\n", primaryDir)
+					break
+				}
+			}
+			if !found {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "No available node for primary shard"})
+				return
+			}
+		}
+
 		os.MkdirAll(primaryDir, os.ModePerm)
-
-		//shardDir := filepath.Join("shards", fmt.Sprintf("node%d", i+1))
-		//err := os.MkdirAll(shardDir, os.ModePerm)
-		//if err != nil {
-		//	c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create shard directory"})
-		//	return
-		//}
-
 		shardFilename := fmt.Sprintf("%s.part%d", saveAs, i+1)
-		//if err := os.WriteFile(shardFilename, shardData, 0644); err != nil {
-		//	c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to write shard"})
-		//	return
-		//}
-		//
-		//shardPaths = append(shardPaths, shardFilename)
 		primaryPath := filepath.Join(primaryDir, shardFilename)
 		if err := os.WriteFile(primaryPath, shardData, 0644); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to write primary shard"})
@@ -80,9 +87,14 @@ func UploadFile(c *gin.Context) {
 		primaryShardPaths = append(primaryShardPaths, primaryPath)
 
 		var replicas []string
-		for r := 1; r <= replicationFactor; r++ {
+		replicaCount := 0
+		for r := 1; replicaCount < config.ReplicationFactor && r <= config.TotalNodes; r++ {
 			replicaNode := (primaryNode + r) % totalNodes
 			replicaDir := filepath.Join("shards", fmt.Sprintf("node%d", replicaNode+1))
+			if !utils.IsNodeAlive(replicaDir) {
+				fmt.Printf("Replica node %s down. Skipping.\n", replicaDir)
+				continue
+			}
 			os.MkdirAll(replicaDir, os.ModePerm)
 
 			replicaPath := filepath.Join(replicaDir, shardFilename)
@@ -90,7 +102,11 @@ func UploadFile(c *gin.Context) {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to write replica shard"})
 				return
 			}
+			replicaCount++
 			replicas = append(replicas, replicaPath)
+		}
+		if replicaCount < config.ReplicationFactor {
+			fmt.Printf("Only %d replicas written for shard %d (expected %d)\n", replicaCount, i+1, config.ReplicationFactor)
 		}
 		redundantShardPaths = append(redundantShardPaths, replicas)
 	}
