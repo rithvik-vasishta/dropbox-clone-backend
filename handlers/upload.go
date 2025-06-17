@@ -2,129 +2,113 @@ package handlers
 
 import (
 	"fmt"
+	"io"
+	"net/http"
+
 	"github.com/gin-gonic/gin"
 	"github.com/lib/pq"
+
+	"github.com/rithvik-vasishta/dropbox-clone/backend/aws"
 	"github.com/rithvik-vasishta/dropbox-clone/backend/config"
 	"github.com/rithvik-vasishta/dropbox-clone/backend/db"
 	"github.com/rithvik-vasishta/dropbox-clone/backend/utils"
-	"io"
-	"net/http"
-	"os"
-	"path/filepath"
 )
-
-numShards := config.NumShards
-replicationFactor := config.ReplicationFactor
-totalNodes := config.TotalNodes
 
 func UploadFile(c *gin.Context) {
 	fileHeader, err := c.FormFile("file")
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "File not provided"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "file not provided"})
 		return
 	}
-
 	saveAs := c.Query("save_file_name")
 	if saveAs == "" {
 		saveAs = fileHeader.Filename
 	}
-
-	srcFile, err := fileHeader.Open()
+	src, err := fileHeader.Open()
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Unable to open uploaded file"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "cannot open file"})
 		return
 	}
-	defer srcFile.Close()
-
-	data, err := io.ReadAll(srcFile)
+	defer src.Close()
+	data, err := io.ReadAll(src)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to read file"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "cannot read file"})
 		return
 	}
 
-	shardSize := len(data) / numShards
-	remainder := len(data) % numShards
-	var primaryShardPaths []string
-	var redundantShardPaths [][]string
+	shardSize := len(data) / config.NumShards
+	remainder := len(data) % config.NumShards
 
-	for i := 0; i < numShards; i++ {
+	var primaryPaths []string
+	var redundantPaths [][]string
+
+	for i := 0; i < config.NumShards; i++ {
 		start := i * shardSize
 		end := start + shardSize
-		if i == numShards-1 {
+		if i == config.NumShards-1 {
 			end += remainder
 		}
-
 		shardData := data[start:end]
+		filenamePart := fmt.Sprintf("%s.part%d", saveAs, i+1)
 
-		primaryNode := i % totalNodes
-		primaryDir := filepath.Join("shards", fmt.Sprintf("node%d", primaryNode+1))
-
-		if !utils.IsNodeAlive(primaryDir) {
-			fmt.Printf("Primary node %s down. Looking for fallback...\n", primaryDir)
-			found := false
-			for j := 0; j < config.TotalNodes; j++ {
-				fallbackDir := fmt.Sprintf("shards/node%d", j+1)
-				if utils.IsNodeAlive(fallbackDir) {
-					primaryDir = fallbackDir
-					found = true
-					fmt.Printf("Using %s instead.\n", primaryDir)
+		primaryIdx := i % config.TotalNodes
+		primaryNode := config.StorageNodes[primaryIdx]
+		if !utils.IsRemoteNodeAlive(primaryNode) {
+			for _, node := range config.StorageNodes {
+				if utils.IsRemoteNodeAlive(node) {
+					fmt.Printf("primary %s down, falling back to %s\n", primaryNode, node)
+					primaryNode = node
 					break
 				}
 			}
-			if !found {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "No available node for primary shard"})
-				return
-			}
 		}
-
-		os.MkdirAll(primaryDir, os.ModePerm)
-		shardFilename := fmt.Sprintf("%s.part%d", saveAs, i+1)
-		primaryPath := filepath.Join(primaryDir, shardFilename)
-		if err := os.WriteFile(primaryPath, shardData, 0644); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to write primary shard"})
+		if err := aws.UploadShardToNode(primaryNode, filenamePart, shardData); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
-		primaryShardPaths = append(primaryShardPaths, primaryPath)
+		primaryPaths = append(primaryPaths, primaryNode+"/shards/"+filenamePart)
 
-		var replicas []string
-		replicaCount := 0
-		for r := 1; replicaCount < config.ReplicationFactor && r <= config.TotalNodes; r++ {
-			replicaNode := (primaryNode + r) % totalNodes
-			replicaDir := filepath.Join("shards", fmt.Sprintf("node%d", replicaNode+1))
-			if !utils.IsNodeAlive(replicaDir) {
-				fmt.Printf("Replica node %s down. Skipping.\n", replicaDir)
+		var reps []string
+		count := 0
+		for r := 1; r <= config.TotalNodes && count < config.ReplicationFactor; r++ {
+			idx := (primaryIdx + r) % config.TotalNodes
+			node := config.StorageNodes[idx]
+			if !utils.IsRemoteNodeAlive(node) {
+				fmt.Printf("[⚠] replica %s down, skip\n", node)
 				continue
 			}
-			os.MkdirAll(replicaDir, os.ModePerm)
-
-			replicaPath := filepath.Join(replicaDir, shardFilename)
-			if err := os.WriteFile(replicaPath, shardData, 0644); err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to write replica shard"})
-				return
+			if err := aws.UploadShardToNode(node, filenamePart, shardData); err != nil {
+				fmt.Printf("[‼] upload to %s failed: %v\n", node, err)
+				continue
 			}
-			replicaCount++
-			replicas = append(replicas, replicaPath)
+			reps = append(reps, node+"/shards/"+filenamePart)
+			count++
 		}
-		if replicaCount < config.ReplicationFactor {
-			fmt.Printf("Only %d replicas written for shard %d (expected %d)\n", replicaCount, i+1, config.ReplicationFactor)
+		if count < config.ReplicationFactor {
+			fmt.Printf("[⚠] only %d/%d replicas for shard %d\n",
+				count, config.ReplicationFactor, i+1)
 		}
-		redundantShardPaths = append(redundantShardPaths, replicas)
+		redundantPaths = append(redundantPaths, reps)
 	}
 
 	_, err = db.DB.Exec(`
-        INSERT INTO file_metadata (filename, num_shards, primary_shards, redundant_shards)
-        VALUES ($1, $2, $3, $4)
-    `, saveAs, numShards, pq.Array(primaryShardPaths), pq.Array(redundantShardPaths))
+		INSERT INTO file_metadata
+		  (filename, num_shards, primary_shards, redundant_shards)
+		VALUES ($1,$2,$3,$4)
+	`, saveAs,
+		config.NumShards,
+		pq.Array(primaryPaths),
+		pq.Array(redundantPaths),
+	)
 	if err != nil {
-		fmt.Println("DB Failed to insert file metadata:", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to store metadata in DB"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "db insert failed: " + err.Error()})
 		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"message":          "File uploaded and sharded with redundancy",
+		"message":          "uploaded with redundancy",
 		"filename":         saveAs,
-		"primary_shards":   primaryShardPaths,
-		"redundant_shards": redundantShardPaths,
+		"primary_shards":   primaryPaths,
+		"redundant_shards": redundantPaths,
 	})
 }

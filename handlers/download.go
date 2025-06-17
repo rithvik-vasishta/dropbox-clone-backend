@@ -2,90 +2,102 @@ package handlers
 
 import (
 	"fmt"
-	"github.com/gin-gonic/gin"
-	"github.com/lib/pq"
-	"github.com/rithvik-vasishta/dropbox-clone/backend/config"
-	"github.com/rithvik-vasishta/dropbox-clone/backend/db"
-	"github.com/rithvik-vasishta/dropbox-clone/backend/utils"
 	"io"
 	"net/http"
-	"os"
 	"strings"
+
+	"github.com/gin-gonic/gin"
+	"github.com/lib/pq"
+
+	"github.com/rithvik-vasishta/dropbox-clone/backend/aws"
+	"github.com/rithvik-vasishta/dropbox-clone/backend/db"
+	"github.com/rithvik-vasishta/dropbox-clone/backend/utils"
 )
 
 func parse2DArray(raw string) [][]string {
 	raw = strings.Trim(raw, "{}")
-	rows := strings.Split(raw, "},{")
-
-	var result [][]string
-	for _, row := range rows {
-		row = strings.Trim(row, "{}")
-		parts := strings.Split(row, ",")
-		result = append(result, parts)
+	parts := strings.Split(raw, "},{")
+	out := make([][]string, len(parts))
+	for i, p := range parts {
+		p = strings.Trim(p, "{}")
+		if p == "" {
+			out[i] = []string{}
+		} else {
+			out[i] = strings.Split(p, ",")
+		}
 	}
-	return result
+	return out
 }
 
 func DownloadFile(c *gin.Context) {
 	filename := c.Param("file")
-	fmt.Println("Requested Filename", filename)
+	fmt.Println("Download:", filename)
 
 	var primaryPaths []string
 	var redundantRaw string
+
 	err := db.DB.QueryRow(`
-	SELECT primary_shards, REPLACE(redundant_shards::text, '\"', '') 
-	FROM file_metadata 
-	WHERE filename = $1
-`, filename).Scan(
-		pq.Array(&primaryPaths),
-		&redundantRaw,
-	)
-
-	redundantPaths := parse2DArray(redundantRaw)
-
+	  SELECT primary_shards,
+	         REPLACE(redundant_shards::text,'"','')
+	    FROM file_metadata
+	   WHERE filename = $1
+	`, filename).Scan(pq.Array(&primaryPaths), &redundantRaw)
 	if err != nil {
-		fmt.Printf("Error querying shards: %v\n", err)
-		c.JSON(http.StatusNotFound, gin.H{"error": "File not found"})
+		c.JSON(http.StatusNotFound, gin.H{"error": "file not found"})
 		return
 	}
+
+	redundantPaths := parse2DArray(redundantRaw)
 
 	c.Header("Content-Disposition", "attachment; filename="+filename)
 	c.Header("Content-Type", "application/octet-stream")
 
-	for i, primaryPath := range primaryPaths {
-		var part *os.File
-		part, err = os.Open(primaryPath)
-		if err != nil {
-			fmt.Println("[-] Primary shard", i, "failed:", primaryPath, "→", err)
+	//client := &http.Client{Timeout: 5 * time.Second}
 
-			// Try replicas
-			replicas := redundantPaths[i]
-			replicaUsed := false
-			for _, replicaPath := range replicas {
-				part, err = os.Open(replicaPath)
+	for i, url := range primaryPaths {
+		parts := strings.SplitN(url, "/shards/", 2)
+		node, path := parts[0], "/shards/"+parts[1]
+
+		var resp *http.Response
+		if utils.IsRemoteNodeAlive(node) {
+			resp, err = aws.DownloadShardFromNode(node, path)
+		} else {
+			err = fmt.Errorf("node down")
+		}
+
+		if err != nil {
+			fmt.Println("[-] primary shard", i, "failed:", err)
+			found := false
+			for _, repURL := range redundantPaths[i] {
+				parts = strings.SplitN(repURL, "/shards/", 2)
+				node, path = parts[0], "/shards/"+parts[1]
+				if !utils.IsRemoteNodeAlive(node) {
+					continue
+				}
+				resp, err = aws.DownloadShardFromNode(node, path)
 				if err == nil {
-					fmt.Println("[++] Using replica for shard", i, ":", replicaPath)
-					replicaUsed = true
+					fmt.Println("[++] using replica shard", i)
+					found = true
 					break
 				}
 			}
-
-			if !replicaUsed {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("All replicas failed for shard %d", i)})
+			if !found {
+				c.JSON(http.StatusInternalServerError, gin.H{
+					"error": fmt.Sprintf("all replicas failed for shard %d", i+1),
+				})
 				return
 			}
-		} else {
-			fmt.Println("[+] Primary shard", i, "OK:", primaryPath)
 		}
 
 		func() {
-			defer part.Close()
-			_, err = io.Copy(c.Writer, part)
-			if err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to stream shard %d", i)})
+			defer resp.Body.Close()
+			if _, err := io.Copy(c.Writer, resp.Body); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{
+					"error": fmt.Sprintf("failed streaming shard %d", i+1),
+				})
 			}
 		}()
 	}
 
-	fmt.Println("File stream complete for", filename)
+	fmt.Println("Download complete for", filename)
 }

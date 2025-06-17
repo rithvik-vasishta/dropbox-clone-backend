@@ -2,8 +2,15 @@ package utils
 
 import (
 	"fmt"
+	"net/http"
 	"os"
-	"path/filepath"
+	"time"
+)
+
+const (
+	MaxRetries    = 3
+	RetryInterval = 300 * time.Millisecond
+	Timeout       = 1 * time.Second
 )
 
 func IsNodeAlive(path string) bool {
@@ -22,4 +29,17 @@ func HeartbeatAllNodes(totalNodes int) map[string]bool {
 		status[nodePath] = IsNodeAlive(nodePath)
 	}
 	return status
+}
+
+func IsRemoteNodeAlive(nodeURL string) bool {
+	client := http.Client{Timeout: Timeout}
+	for i := 0; i < MaxRetries; i++ {
+		resp, err := client.Get(nodeURL + "/heartbeat")
+		if err == nil && resp.StatusCode == http.StatusOK {
+			resp.Body.Close()
+			return true
+		}
+		time.Sleep(RetryInterval)
+	}
+	return false
 }
