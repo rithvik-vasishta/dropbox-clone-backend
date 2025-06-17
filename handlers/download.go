@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"path/filepath"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -31,6 +32,14 @@ func parse2DArray(raw string) [][]string {
 
 func DownloadFile(c *gin.Context) {
 	filename := c.Param("file")
+	raw := c.Param("file")
+	clean := filepath.Clean(raw)
+	clean = strings.TrimPrefix(clean, "/")
+	if strings.Contains(clean, "..") {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid path"})
+		return
+	}
+	filename = clean
 	fmt.Println("Download:", filename)
 
 	var primaryPaths []string
@@ -49,7 +58,7 @@ func DownloadFile(c *gin.Context) {
 
 	redundantPaths := parse2DArray(redundantRaw)
 
-	c.Header("Content-Disposition", "attachment; filename="+filename)
+	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", filepath.Base(filename)))
 	c.Header("Content-Type", "application/octet-stream")
 
 	//client := &http.Client{Timeout: 5 * time.Second}
@@ -76,7 +85,7 @@ func DownloadFile(c *gin.Context) {
 				}
 				resp, err = aws.DownloadShardFromNode(node, path)
 				if err == nil {
-					fmt.Println("[++] using replica shard", i)
+					fmt.Println("using replica shard", i)
 					found = true
 					break
 				}

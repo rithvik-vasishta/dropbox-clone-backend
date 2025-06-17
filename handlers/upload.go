@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"path/filepath"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/lib/pq"
@@ -24,6 +26,18 @@ func UploadFile(c *gin.Context) {
 	if saveAs == "" {
 		saveAs = fileHeader.Filename
 	}
+	raw := c.Query("save_file_name")
+	if raw == "" {
+		raw = fileHeader.Filename
+	}
+	clean := filepath.Clean(raw)
+	clean = strings.TrimPrefix(clean, string(filepath.Separator))
+	if strings.Contains(clean, "..") {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid path"})
+		return
+	}
+	saveAs = clean
+
 	src, err := fileHeader.Open()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "cannot open file"})
@@ -74,18 +88,18 @@ func UploadFile(c *gin.Context) {
 			idx := (primaryIdx + r) % config.TotalNodes
 			node := config.StorageNodes[idx]
 			if !utils.IsRemoteNodeAlive(node) {
-				fmt.Printf("[⚠] replica %s down, skip\n", node)
+				fmt.Printf("replica %s down, skip\n", node)
 				continue
 			}
 			if err := aws.UploadShardToNode(node, filenamePart, shardData); err != nil {
-				fmt.Printf("[‼] upload to %s failed: %v\n", node, err)
+				fmt.Printf("upload to %s failed: %v\n", node, err)
 				continue
 			}
 			reps = append(reps, node+"/shards/"+filenamePart)
 			count++
 		}
 		if count < config.ReplicationFactor {
-			fmt.Printf("[⚠] only %d/%d replicas for shard %d\n",
+			fmt.Printf("only %d/%d replicas for shard %d\n",
 				count, config.ReplicationFactor, i+1)
 		}
 		redundantPaths = append(redundantPaths, reps)
