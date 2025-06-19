@@ -12,4 +12,10 @@ func RegisterRoutes(router *gin.Engine) {
 	router.POST("/upload/*file", handlers.UploadFile)
 	//router.GET("/download/:file", handlers.DownloadFile)
 	router.GET("/download/*file", handlers.DownloadFile)
+
+	auth := router.Group("/auth")
+	{
+		auth.POST("/register", handlers.Register)
+		auth.POST("/login", handlers.Login)
+	}
 }
